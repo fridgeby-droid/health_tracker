@@ -15,7 +15,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import BufferedInputFile, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -108,7 +108,9 @@ def number(s):
 
 
 def main_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    app_url = os.getenv('WEBAPP_URL', '').strip()
+    items = ([InlineKeyboardButton(text='📱 Открыть Mini App', web_app=WebAppInfo(url=app_url))] if app_url.startswith('https://') else [])
+    return InlineKeyboardMarkup(inline_keyboard=([items] if items else []) + [
         [InlineKeyboardButton(text='📅 Сегодня', callback_data='view:today'),
          InlineKeyboardButton(text='📈 7 дней', callback_data='view:week')],
         [InlineKeyboardButton(text='🩺 Измерения', callback_data='view:history'),
@@ -187,6 +189,13 @@ def reminders_text(d):
     return '🔔 Напоминания:\n' + '\n'.join(
         f"#{r['id']} · {r['local_time']} · {r['title']}" for r in rows) if rows else 'Напоминаний нет.'
 
+
+@router.message(Command('app'))
+async def app_cmd(m: Message):
+    url = os.getenv('WEBAPP_URL','').strip()
+    if not url.startswith('https://'):
+        return await m.answer('Укажите WEBAPP_URL с HTTPS в переменных окружения и перезапустите бота.')
+    await m.answer('📱 Откройте дневник здоровья:', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Открыть Mini App', web_app=WebAppInfo(url=url))]]))
 
 @router.message(Command('menu'))
 async def menu_cmd(m: Message):
@@ -269,7 +278,8 @@ HELP = '''🩺 Health Tracker — дневник здоровья
 @router.message(Command('help'))
 async def welcome(m: Message):
     await modify(m.from_user.id, lambda d: None)
-    await m.answer(HELP, reply_markup=main_menu())
+    from wizard import menu as wizard_menu
+    await m.answer('🩺 Добро пожаловать! Быстрый ввод — кнопками ниже. В /app доступен Mini App.\n\n'+HELP, reply_markup=wizard_menu)
 
 
 @router.message(Command('timezone'))
@@ -457,10 +467,21 @@ async def main():
     bot = Bot(TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+    from wizard import router as wizard_router, menu as wizard_menu
+    dp.include_router(wizard_router)
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([BotCommand(command='start',description='Начать'), BotCommand(command='app',description='Открыть Mini App'), BotCommand(command='menu',description='Меню'), BotCommand(command='today',description='Сегодня'), BotCommand(command='help',description='Помощь')])
     task = asyncio.create_task(reminders_worker(bot))
+    from miniapp_api import app
+    import uvicorn
+    config=uvicorn.Config(app,host='0.0.0.0',port=int(os.getenv('PORT','8080')),log_level='info',access_log=False)
+    server=uvicorn.Server(config)
+    api_task=asyncio.create_task(server.serve())
     try:
         await dp.start_polling(bot)
     finally:
+        server.should_exit=True
+        await api_task
         task.cancel()
         try: await task
         except asyncio.CancelledError: pass
