@@ -6,7 +6,7 @@ import os
 import re
 import tempfile
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -15,7 +15,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -107,6 +107,131 @@ def number(s):
     return value
 
 
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📅 Сегодня', callback_data='view:today'),
+         InlineKeyboardButton(text='📈 7 дней', callback_data='view:week')],
+        [InlineKeyboardButton(text='🩺 Измерения', callback_data='view:history'),
+         InlineKeyboardButton(text='🥗 Питание', callback_data='view:foodlog')],
+        [InlineKeyboardButton(text='🏃 Тренировки', callback_data='view:workouts'),
+         InlineKeyboardButton(text='🔔 Напоминания', callback_data='view:reminders')],
+        [InlineKeyboardButton(text='❔ Команды', callback_data='view:help')],
+    ])
+
+
+def fmt_number(value):
+    return f'{value:g}'
+
+
+def summarize(data, days=1):
+    tz = tz_for(data)
+    today = now().astimezone(tz).date()
+    start = today - timedelta(days=days-1)
+    def selected(group):
+        return [r for r in data[group] if start <= datetime.fromisoformat(r['at']).astimezone(tz).date() <= today]
+    foods = selected('foods')
+    workouts = selected('workouts')
+    metrics = selected('metrics')
+    sums = {key: sum(r.get(key, 0) or 0 for r in foods) for key in ('calories', 'protein', 'fat', 'carbs')}
+    exercise_minutes = sum(r['minutes'] for r in workouts)
+    exercise_kcal = sum(r.get('calories') or 0 for r in workouts)
+    weight = [r for r in metrics if r['kind'] == 'weight']
+    pressure = [r for r in metrics if r['kind'] == 'pressure']
+    pulse = [r for r in metrics if r['kind'] == 'pulse']
+    header = '📅 Сегодня' if days == 1 else f'📈 Последние {days} дней'
+    result = [header, '', f'🥗 Питание: {len(foods)} записей',
+              f'🔥 {sums["calories"]:.0f} ккал · Б {sums["protein"]:.1f} · Ж {sums["fat"]:.1f} · У {sums["carbs"]:.1f}',
+              f'🏃 Тренировки: {len(workouts)} · {exercise_minutes} минут']
+    if exercise_kcal:
+        result.append(f'⚡ Записанный расход: {exercise_kcal:.0f} ккал (оценка)')
+    result.append(f'🩺 Измерений: {len(metrics)}')
+    if weight:
+        last = max(weight, key=lambda r:r['at'])
+        result.append(f'⚖️ Последний вес: {fmt_number(last["v1"])} кг')
+        if days > 1 and len(weight) > 1:
+            first = min(weight, key=lambda r:r['at'])
+            result.append(f'↔️ Изменение между первой и последней записями: {last["v1"]-first["v1"]:+.1f} кг')
+    if pressure:
+        last = max(pressure, key=lambda r:r['at'])
+        result.append(f'❤️ Последнее давление: {fmt_number(last["v1"])} / {fmt_number(last["v2"])}')
+    if pulse:
+        last = max(pulse, key=lambda r:r['at'])
+        result.append(f'💓 Последний пульс: {fmt_number(last["v1"])}')
+    result.append('')
+    result.append('Данные только по внесённым записям; неполный дневник не означает нулевое потребление.')
+    return '\n'.join(result)
+
+
+def history_text(d):
+    rows = sorted(d['metrics'], key=lambda r:r['at'], reverse=True)[:15]
+    return '📋 Последние измерения:\n' + '\n'.join(
+        f"#{r['id']} · {format_at(r, tz_for(d))} · {r['kind']}: {r['v1']:g}" +
+        (f"/{r['v2']:g}" if r['v2'] is not None else '') for r in rows) if rows else 'Измерений пока нет.'
+
+
+def foodlog_text(d):
+    rows = sorted(d['foods'], key=lambda r:r['at'], reverse=True)[:15]
+    return '🥗 Питание:\n' + '\n'.join(
+        f"#{r['id']} · {format_at(r, tz_for(d))} · {r['title']}, {r['grams']:g} г · {r['calories']:g} ккал" for r in rows) if rows else 'Питание ещё не записывали.'
+
+
+def workouts_text(d):
+    rows = sorted(d['workouts'], key=lambda r:r['at'], reverse=True)[:15]
+    return '🏋️ Тренировки:\n' + '\n'.join(
+        f"#{r['id']} · {format_at(r, tz_for(d))} · {r['title']} · {r['minutes']} мин" +
+        (f" · {r['calories']:g} ккал" if r['calories'] is not None else '') for r in rows) if rows else 'Тренировок пока нет.'
+
+
+def reminders_text(d):
+    rows = sorted((r for r in d['reminders'] if r['active']), key=lambda r:r['local_time'])
+    return '🔔 Напоминания:\n' + '\n'.join(
+        f"#{r['id']} · {r['local_time']} · {r['title']}" for r in rows) if rows else 'Напоминаний нет.'
+
+
+@router.message(Command('menu'))
+async def menu_cmd(m: Message):
+    await m.answer('🩺 Health Tracker\nВыберите раздел:', reply_markup=main_menu())
+
+
+@router.message(Command('today', 'week'))
+async def summary_cmd(m: Message):
+    cmd = m.text.split()[0].split('@')[0][1:]
+    d = await read(m.from_user.id)
+    await m.answer(summarize(d, 7 if cmd == 'week' else 1), reply_markup=main_menu())
+
+
+@router.callback_query(lambda c: bool(c.data and c.data.startswith('view:')))
+async def view_callback(c: CallbackQuery):
+    key = c.data.partition(':')[2]
+    d = await read(c.from_user.id)
+    views = {'today': lambda: summarize(d, 1), 'week': lambda: summarize(d, 7),
+             'history': lambda: history_text(d), 'foodlog': lambda: foodlog_text(d),
+             'workouts': lambda: workouts_text(d), 'reminders': lambda: reminders_text(d),
+             'help': lambda: HELP}
+    if key not in views:
+        return await c.answer('Неизвестная команда')
+    await c.message.answer(views[key](), reply_markup=main_menu())
+    await c.answer()
+
+
+@router.message(Command('delete'))
+async def delete_record(m: Message):
+    try:
+        rid = int(tail(m))
+        if rid <= 0: raise ValueError
+    except ValueError:
+        return await m.answer('Формат: /delete 15 — удалить запись по номеру #15. Для напоминаний используйте /unremind.')
+    def remove(d):
+        for group in ('metrics', 'foods', 'workouts'):
+            for i, record in enumerate(d[group]):
+                if record['id'] == rid:
+                    d[group].pop(i)
+                    return group
+        return None
+    group = await modify(m.from_user.id, remove)
+    await m.answer(f'🗑 Запись #{rid} удалена ({group}).' if group else 'Запись не найдена. Напоминания отключаются через /unremind.')
+
+
 HELP = '''🩺 Health Tracker — дневник здоровья
 
 📊 Показатели:
@@ -133,6 +258,9 @@ HELP = '''🩺 Health Tracker — дневник здоровья
 /unremind 3 — отключить напоминание
 /timezone Europe/Moscow — часовой пояс
 
+📅 /today — сводка за сегодня; /week — за 7 дней
+🧭 /menu — кнопочное меню
+🗑 /delete 15 — удалить запись #15
 📦 /export — скачать все свои данные в JSON
 Все записи сохраняются отдельно для каждого пользователя.'''
 
@@ -141,7 +269,7 @@ HELP = '''🩺 Health Tracker — дневник здоровья
 @router.message(Command('help'))
 async def welcome(m: Message):
     await modify(m.from_user.id, lambda d: None)
-    await m.answer(HELP)
+    await m.answer(HELP, reply_markup=main_menu())
 
 
 @router.message(Command('timezone'))
@@ -188,12 +316,7 @@ async def metric_add(m: Message):
 
 @router.message(Command('history'))
 async def history(m: Message):
-    d = await read(m.from_user.id)
-    rows = sorted(d['metrics'], key=lambda r:r['at'], reverse=True)[:20]
-    if not rows: return await m.answer('Измерений пока нет.')
-    lines = [f"{format_at(r, tz_for(d))} · {r['kind']}: {r['v1']:g}" +
-             (f"/{r['v2']:g}" if r['v2'] is not None else '') for r in rows]
-    await m.answer('📋 Последние измерения:\n' + '\n'.join(lines))
+    await m.answer(history_text(await read(m.from_user.id)))
 
 
 @router.message(Command('chart'))
@@ -238,11 +361,7 @@ async def food(m: Message):
 
 @router.message(Command('foodlog'))
 async def foodlog(m: Message):
-    d = await read(m.from_user.id)
-    rows = sorted(d['foods'], key=lambda r:r['at'], reverse=True)[:20]
-    if not rows: return await m.answer('Питание ещё не записывали.')
-    await m.answer('🥗 Питание:\n' + '\n'.join(
-        f"{format_at(r, tz_for(d))} · {r['title']}, {r['grams']:g} г · {r['calories']:g} ккал" for r in rows))
+    await m.answer(foodlog_text(await read(m.from_user.id)))
 
 
 @router.message(Command('workout'))
@@ -261,12 +380,7 @@ async def workout(m: Message):
 
 @router.message(Command('workouts'))
 async def workouts(m: Message):
-    d = await read(m.from_user.id)
-    rows = sorted(d['workouts'], key=lambda r:r['at'], reverse=True)[:20]
-    if not rows: return await m.answer('Тренировок пока нет.')
-    await m.answer('🏋️ Тренировки:\n' + '\n'.join(
-        f"{format_at(r, tz_for(d))} · {r['title']} · {r['minutes']} мин" +
-        (f" · {r['calories']:g} ккал" if r['calories'] is not None else '') for r in rows))
+    await m.answer(workouts_text(await read(m.from_user.id)))
 
 
 @router.message(Command('remind'))
@@ -281,10 +395,7 @@ async def remind(m: Message):
 
 @router.message(Command('reminders'))
 async def reminders(m: Message):
-    d = await read(m.from_user.id)
-    rows = sorted((r for r in d['reminders'] if r['active']), key=lambda r:r['local_time'])
-    await m.answer('🔔 Напоминания:\n' + '\n'.join(
-        f"#{r['id']} · {r['local_time']} · {r['title']}" for r in rows) if rows else 'Напоминаний нет.')
+    await m.answer(reminders_text(await read(m.from_user.id)))
 
 
 @router.message(Command('unremind'))
